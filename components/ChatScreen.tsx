@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import type { Chat } from '@google/genai';
-import { createChatSession, generateGroundedContent, generateTitle, generateConversationInsights, refineContent, embedContent, cosineSimilarity } from '../services/geminiService';
+import { createChatSession, generateGroundedContent, generateTitle, generateConversationInsights, refineContent, embedContent, cosineSimilarity, withRetry } from '../services/geminiService';
 import type { Message, User, Conversation, ReasoningMode, GroundingMode, VectorEntry, ConversationInsights, Feedback } from '../types';
 import { UserIcon } from './icons/UserIcon';
 import { BotIcon } from './icons/BotIcon';
@@ -32,11 +32,13 @@ import { ThumbsDownIcon } from './icons/ThumbsDownIcon';
 import { FeedbackModal } from './FeedbackModal';
 import { Logo } from './Logo';
 import { ErrorIcon } from './icons/ErrorIcon';
+import { ConfirmationModal } from './ConfirmationModal';
 
 
 // Fix: Add type definitions for the Web Speech API to resolve TypeScript errors.
 interface SpeechRecognitionEvent extends Event {
   results: SpeechRecognitionResultList;
+  resultIndex: number;
 }
 
 interface SpeechRecognitionResultList {
@@ -96,6 +98,7 @@ const ChatScreen: React.FC<ChatScreenProps> = ({ user, onLogout, onProfileUpdate
   const [groundingMode, setGroundingMode] = useState<GroundingMode>(user.groundingMode);
   const [isListening, setIsListening] = useState(false);
   const [isSpeechApiSupported, setIsSpeechApiSupported] = useState(false);
+  const [speechError, setSpeechError] = useState<string | null>(null);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [isInsightsModalOpen, setIsInsightsModalOpen] = useState(false);
   const [currentInsights, setCurrentInsights] = useState<ConversationInsights | null>(null);
@@ -105,10 +108,12 @@ const ChatScreen: React.FC<ChatScreenProps> = ({ user, onLogout, onProfileUpdate
   const [refinementError, setRefinementError] = useState<{ messageId: string; error: string } | null>(null);
   const [isVectorDBModalOpen, setIsVectorDBModalOpen] = useState(false);
   const [feedbackMessage, setFeedbackMessage] = useState<Message | null>(null);
+  const [conversationToDeleteId, setConversationToDeleteId] = useState<string | null>(null);
   
   const chatRef = useRef<Chat | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const recognitionRef = useRef<SpeechRecognition | null>(null);
+  const transcriptPrefixRef = useRef<string>('');
   const menuPanelRef = useRef<HTMLDivElement | null>(null);
   const menuTriggerRef = useRef<Element | null>(null);
   const storageKey = `chatHistory_${user.username}`;
@@ -201,13 +206,25 @@ const ChatScreen: React.FC<ChatScreenProps> = ({ user, onLogout, onProfileUpdate
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [storageKey]);
 
-  // Save conversations to localStorage when they change
+  // Auto-save conversations to localStorage with debouncing
   useEffect(() => {
-    if (conversations.length > 0) {
-      localStorage.setItem(storageKey, JSON.stringify(conversations));
-    } else {
-      localStorage.removeItem(storageKey);
-    }
+    const saveTimer = setTimeout(() => {
+      if (conversations.length > 0) {
+        try {
+          localStorage.setItem(storageKey, JSON.stringify(conversations));
+        } catch (error) {
+          console.error("Auto-save failed: Could not write to localStorage.", error);
+          // In a real-world app, you might want to show a non-intrusive notification to the user
+        }
+      } else {
+        // If the last conversation is deleted, remove the history from storage.
+        localStorage.removeItem(storageKey);
+      }
+    }, 500); // Debounce save by 500ms to improve performance
+
+    return () => {
+      clearTimeout(saveTimer);
+    };
   }, [conversations, storageKey]);
 
   // Setup Speech Recognition
@@ -221,18 +238,32 @@ const ChatScreen: React.FC<ChatScreenProps> = ({ user, onLogout, onProfileUpdate
     setIsSpeechApiSupported(true);
     const recognition = new SpeechRecognition();
     recognition.continuous = false;
-    recognition.interimResults = false;
+    recognition.interimResults = true; // Enable interim results for real-time feedback
     recognition.lang = 'en-US';
 
     recognition.onstart = () => setIsListening(true);
     recognition.onend = () => setIsListening(false);
-    recognition.onerror = (event) => {
-      console.error('Speech recognition error:', event.error);
-      setIsListening(false);
+    recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+        console.error('Speech recognition error:', event.error);
+        if (event.error === 'not-allowed') {
+            setSpeechError("Microphone access was denied. To use voice input, please allow microphone permissions in your browser's settings.");
+        } else {
+            setSpeechError(`An error occurred during speech recognition: ${event.error}`);
+        }
+        setIsListening(false);
     };
-    recognition.onresult = (event) => {
-      const transcript = event.results[0][0].transcript;
-      setInput(prev => (prev ? prev + ' ' : '') + transcript);
+    
+    recognition.onresult = (event: SpeechRecognitionEvent) => {
+        // The SpeechRecognitionResultList is a cumulative list of all results for this session.
+        // We create the full transcript for the session by joining all parts.
+        // This provides real-time feedback as the user speaks.
+        const sessionTranscript = Array.from(event.results)
+          .map(result => result[0].transcript)
+          .join('');
+
+        // Update the input with the text that existed before listening started (prefix)
+        // plus the full transcript from the current listening session.
+        setInput(transcriptPrefixRef.current + sessionTranscript);
     };
 
     recognitionRef.current = recognition;
@@ -263,17 +294,29 @@ const ChatScreen: React.FC<ChatScreenProps> = ({ user, onLogout, onProfileUpdate
   };
 
   const handleDeleteConversation = (id: string) => {
-    setConversations(prev => prev.filter(c => c.id !== id));
-    if (activeConversationId === id) {
-        const remainingConversations = conversations.filter(c => c.id !== id);
-        if (remainingConversations.length > 0) {
-            setActiveConversationId(remainingConversations.sort((a,b) => b.timestamp - a.timestamp)[0].id);
-        } else {
-            setActiveConversationId(null);
-            handleNewChat(); // Create a new chat if the last one was deleted
-        }
-    }
+    setConversationToDeleteId(id);
   };
+
+  const confirmDeleteConversation = useCallback(() => {
+    if (!conversationToDeleteId) return;
+
+    setConversations(prevConversations => {
+        const updatedConversations = prevConversations.filter(c => c.id !== conversationToDeleteId);
+        
+        if (activeConversationId === conversationToDeleteId) {
+            if (updatedConversations.length > 0) {
+                const mostRecent = updatedConversations.sort((a, b) => b.timestamp - a.timestamp)[0];
+                setActiveConversationId(mostRecent.id);
+            } else {
+                handleNewChat();
+            }
+        }
+        
+        return updatedConversations;
+    });
+
+    setConversationToDeleteId(null);
+  }, [conversationToDeleteId, activeConversationId, handleNewChat]);
 
   const handleToggleReasoningMode = useCallback(() => {
     const newMode = reasoningMode === 'normal' ? 'fast' : 'normal';
@@ -288,12 +331,15 @@ const ChatScreen: React.FC<ChatScreenProps> = ({ user, onLogout, onProfileUpdate
 
   const handleToggleListening = useCallback(() => {
     if (!recognitionRef.current || isLoading || !activeConversationId) return;
+    setSpeechError(null);
     if (isListening) {
       recognitionRef.current.stop();
     } else {
+      // Save any existing text to prepend to the transcript
+      transcriptPrefixRef.current = input ? input.trim() + ' ' : '';
       recognitionRef.current.start();
     }
-  }, [isListening, isLoading, activeConversationId]);
+  }, [isListening, isLoading, activeConversationId, input]);
   
   const handleCopy = useCallback((text: string, messageId: string) => {
     if (!text) return;
@@ -473,7 +519,7 @@ const ChatScreen: React.FC<ChatScreenProps> = ({ user, onLogout, onProfileUpdate
         }
         
         if (!chatRef.current) return;
-        const stream = await chatRef.current.sendMessageStream({ message: finalPrompt });
+        const stream = await withRetry(() => chatRef.current!.sendMessageStream({ message: finalPrompt }));
         
         for await (const chunk of stream) {
           finalModelResponse += chunk.text;
@@ -520,7 +566,7 @@ const ChatScreen: React.FC<ChatScreenProps> = ({ user, onLogout, onProfileUpdate
         })();
       }
     }
-  }, [input, isLoading, activeConversationId, conversations, groundingMode, vectorDBStorageKey]);
+  }, [input, isLoading, activeConversationId, conversations, groundingMode, vectorDBStorageKey, handleNewChat]);
 
   return (
     <>
@@ -694,14 +740,30 @@ const ChatScreen: React.FC<ChatScreenProps> = ({ user, onLogout, onProfileUpdate
           </div>
 
           <div className="p-4 border-t border-[var(--border-color)]">
+            {speechError && (
+              <div role="alert" className="bg-red-100 border border-red-400 text-red-700 dark:bg-red-900/50 dark:border-red-700 dark:text-red-300 px-4 py-2 rounded-lg relative mb-3 text-sm flex items-center justify-between">
+                <span>{speechError}</span>
+                <button 
+                  onClick={() => setSpeechError(null)} 
+                  className="p-1 rounded-full hover:bg-red-200/50 dark:hover:bg-red-800/50"
+                  aria-label="Dismiss error"
+                  title="Dismiss"
+                >
+                  <CloseIcon />
+                </button>
+              </div>
+            )}
             <div className="relative">
               <input
                 type="text"
                 value={input}
-                onChange={(e) => setInput(e.target.value)}
+                onChange={(e) => {
+                    setInput(e.target.value);
+                    if (speechError) setSpeechError(null);
+                }}
                 onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSend()}
                 placeholder={isListening ? "Listening..." : (activeConversationId ? "Ask anything..." : "Loading...")}
-                className="w-full pl-4 pr-24 py-3 bg-[rgb(var(--input-bg-rgb))] rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all"
+                className={`w-full pl-4 pr-24 py-3 bg-[rgb(var(--input-bg-rgb))] rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all ${isListening ? 'text-gray-400 dark:text-gray-500' : ''}`}
                 disabled={isLoading || !activeConversationId}
                 aria-label="Chat input"
               />
@@ -875,6 +937,15 @@ const ChatScreen: React.FC<ChatScreenProps> = ({ user, onLogout, onProfileUpdate
             </div>
         </div>
       )}
+
+      <ConfirmationModal
+        isOpen={!!conversationToDeleteId}
+        onClose={() => setConversationToDeleteId(null)}
+        onConfirm={confirmDeleteConversation}
+        title="Delete Conversation"
+        message="Are you sure you want to permanently delete this conversation? This action cannot be undone."
+        confirmText="Delete"
+      />
 
       <InsightsModal
         isOpen={isInsightsModalOpen}

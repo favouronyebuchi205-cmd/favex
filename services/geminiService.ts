@@ -10,6 +10,48 @@ if (!process.env.API_KEY) {
 // Fix: Replaced deprecated 'GoogleGenerativeAI' with 'GoogleGenAI' as per SDK guidelines.
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
+// A new centralized error handler for API responses.
+const handleApiError = (error: unknown, defaultMessage: string): Error => {
+  const errorMessage = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  
+  const isRateLimitError = errorMessage.includes('429') || errorMessage.includes('resource_exhausted');
+
+  if (isRateLimitError) {
+    return new Error("API rate limit exceeded. Please check your plan and billing details.");
+  }
+  
+  return new Error(defaultMessage);
+};
+
+
+// Utility for retrying API calls with exponential backoff
+export const withRetry = async <T>(apiCall: () => Promise<T>, maxRetries = 3, initialDelay = 1000): Promise<T> => {
+  let attempt = 1;
+  while (attempt <= maxRetries) {
+    try {
+      return await apiCall();
+    } catch (error) {
+      const errorMessage = (error instanceof Error ? error.message : String(error)).toLowerCase();
+      
+      const isRateLimitError = errorMessage.includes('429') || errorMessage.includes('resource_exhausted');
+
+      if (isRateLimitError && attempt < maxRetries) {
+        const delay = initialDelay * Math.pow(2, attempt - 1);
+        console.warn(
+          `API rate limit exceeded. Retrying in ${delay / 1000}s... (Attempt ${attempt}/${maxRetries})`
+        );
+        await new Promise(resolve => setTimeout(resolve, delay));
+        attempt++;
+      } else {
+        throw error; // Re-throw if not a rate limit error or if max retries are reached
+      }
+    }
+  }
+  // This line should not be reachable if the loop logic is correct, but it satisfies TypeScript's requirement that the function must return a value or throw.
+  throw new Error('Exceeded max retries for API call.');
+};
+
+
 export const DEFAULT_SYSTEM_INSTRUCTION = 'You are FAV AI, a friendly and helpful assistant. Your tone should be warm, approachable, and conversational. Prioritize being clear and accurate, but feel free to add a touch of wit. Your primary goal is to assist the user in a positive and engaging way.';
 export const CREATIVE_WRITER_INSTRUCTION = 'You are a master creative writer. Your expertise lies in storytelling, poetry, and evocative prose. Your tone is artistic and imaginative. You should help users craft compelling narratives, write beautiful descriptions, and explore the nuances of language. Your primary goal is to inspire creativity and assist with all forms of artistic writing.';
 export const TECHNICAL_EXPERT_INSTRUCTION = 'You are a technical expert and programmer. Your communication style is precise, logical, and direct. You provide accurate, efficient, and well-documented solutions to technical problems, code-related queries, and data analysis tasks. You must prioritize correctness and clarity above all else, avoiding conversational fluff. Assume you are speaking to a fellow technical professional.';
@@ -48,13 +90,13 @@ export const createChatSession = (history?: Message[], reasoningMode: ReasoningM
 
 export const generateGroundedContent = async (prompt: string): Promise<{ text: string; sources: { uri: string; title: string }[] }> => {
   try {
-    const response: GenerateContentResponse = await ai.models.generateContent({
+    const response: GenerateContentResponse = await withRetry(() => ai.models.generateContent({
       model: "gemini-2.5-flash",
       contents: prompt,
       config: {
         tools: [{googleSearch: {}}],
       },
-    });
+    }));
 
     const text = response.text;
     const groundingMetadata = response.candidates?.[0]?.groundingMetadata;
@@ -73,24 +115,24 @@ export const generateGroundedContent = async (prompt: string): Promise<{ text: s
 
   } catch (error) {
     console.error("Error generating grounded content:", error);
-    throw new Error("Failed to get a grounded response. The web may be unreachable.");
+    throw handleApiError(error, "Failed to get a grounded response. The web may be unreachable.");
   }
 };
 
 export const generateAvatar = async (prompt: string): Promise<string> => {
   try {
-    const enhancementResponse = await ai.models.generateContent({
+    const enhancementResponse = await withRetry(() => ai.models.generateContent({
       model: 'gemini-2.5-flash',
       contents: `Expand this into a detailed image prompt for a profile avatar: "${prompt}"`,
       config: {
         systemInstruction: "You are a creative prompt engineer for an AI image generator. Your task is to take a user's brief idea and expand it into a single, detailed, descriptive sentence for a futuristic, high-quality avatar. Do not add any conversational text or explanations, just output the enhanced prompt.",
         thinkingConfig: { thinkingBudget: 0 },
       }
-    });
+    }));
 
     const enhancedPrompt = enhancementResponse.text.trim();
 
-    const imageResponse = await ai.models.generateImages({
+    const imageResponse = await withRetry(() => ai.models.generateImages({
       model: 'imagen-4.0-generate-001',
       prompt: enhancedPrompt,
       config: {
@@ -98,7 +140,7 @@ export const generateAvatar = async (prompt: string): Promise<string> => {
         outputMimeType: 'image/png',
         aspectRatio: '1:1',
       },
-    });
+    }));
 
     if (imageResponse.generatedImages && imageResponse.generatedImages.length > 0) {
       const base64ImageBytes: string = imageResponse.generatedImages[0].image.imageBytes;
@@ -107,13 +149,13 @@ export const generateAvatar = async (prompt: string): Promise<string> => {
     throw new Error("No image was generated.");
   } catch (error) {
     console.error("Error generating avatar:", error);
-    throw new Error("Failed to generate AI avatar. Please try again.");
+    throw handleApiError(error, "Failed to generate AI avatar. Please try again.");
   }
 };
 
 export const generateTitle = async (userMessage: string, modelResponse: string): Promise<string> => {
   try {
-    const response = await ai.models.generateContent({
+    const response = await withRetry(() => ai.models.generateContent({
       model: 'gemini-2.5-flash',
       contents: `Based on the following conversation, create a concise title (4 words maximum).\n\nUser: "${userMessage}"\n\nAI: "${modelResponse}"`,
       config: {
@@ -121,7 +163,7 @@ export const generateTitle = async (userMessage: string, modelResponse: string):
         thinkingConfig: { thinkingBudget: 0 },
         maxOutputTokens: 15,
       },
-    });
+    }));
     
     let title = response.text.trim().replace(/["']/g, '');
     if (!title) {
@@ -188,7 +230,7 @@ export const generateConversationInsights = async (messages: Message[]): Promise
     const insightPromises = [];
 
     // Promise for general insights
-    insightPromises.push(ai.models.generateContent({
+    insightPromises.push(withRetry(() => ai.models.generateContent({
       model: 'gemini-2.5-flash',
       contents: `Analyze the following conversation. Provide a concise summary, a list of action items, the overall sentiment (Positive, Negative, Neutral, or Mixed), and a list of up to 5 key topics discussed.\n\n---\n\n${conversationHistory}`,
       config: {
@@ -203,7 +245,7 @@ export const generateConversationInsights = async (messages: Message[]): Promise
           }
         },
       },
-    }));
+    })));
 
     // Promise for feedback themes if there are comments
     if (feedbackSummary.comments.length > 0) {
@@ -211,7 +253,7 @@ export const generateConversationInsights = async (messages: Message[]): Promise
         `Feedback #${i+1}:\n- AI Message: "${c.messageContent}"\n- User's Reason(s): ${c.categories.join(', ') || 'N/A'}\n- User's Comment: "${c.feedbackComment}"`
       ).join('\n\n');
       
-      insightPromises.push(ai.models.generateContent({
+      insightPromises.push(withRetry(() => ai.models.generateContent({
         model: 'gemini-2.5-flash',
         contents: `Based on the following user feedback, identify up to 3 common themes or recurring problems. A theme is a high-level summary of an issue. For example, "AI is too verbose" or "Factual inaccuracies about history".\n\n---\n\n${feedbackContext}`,
         config: {
@@ -223,7 +265,7 @@ export const generateConversationInsights = async (messages: Message[]): Promise
             }
           }
         },
-      }));
+      })));
     }
 
     const [generalInsightsResponse, feedbackThemesResponse] = await Promise.all(insightPromises);
@@ -254,31 +296,33 @@ export const generateConversationInsights = async (messages: Message[]): Promise
 
 export const refineContent = async (instruction: string, content: string): Promise<string> => {
   try {
-    const response = await ai.models.generateContent({
+    const response = await withRetry(() => ai.models.generateContent({
       model: 'gemini-2.5-flash',
       contents: `${instruction}:\n\n---\n\n"${content}"`,
       config: {
         systemInstruction: "You are a text editor. Your task is to modify the given text based on the user's instruction. Output only the modified text, without any additional commentary, conversational text, or quotation marks.",
         thinkingConfig: { thinkingBudget: 0 },
       },
-    });
+    }));
     return response.text.trim();
   } catch (error) {
     console.error("Error refining content:", error);
-    throw new Error("Failed to refine the response. Please try again.");
+    throw handleApiError(error, "Failed to refine the response. Please try again.");
   }
 };
 
 export const embedContent = async (text: string): Promise<number[]> => {
   try {
-    const response = await ai.models.embedContent({
+    const response = await withRetry(() => ai.models.embedContent({
       model: 'text-embedding-004',
-      content: text,
-    });
-    return response.embedding.values;
+      // Fix: The 'embedContent' parameter for the content to be embedded should be 'contents', not 'content'.
+      contents: text,
+    }));
+    // Fix: The response object contains an 'embeddings' property, which is an array of embedding objects.
+    return response.embeddings[0].values;
   } catch (error) {
     console.error("Error embedding content:", error);
-    throw new Error("Failed to create embedding for the provided text.");
+    throw handleApiError(error, "Failed to create embedding for the provided text.");
   }
 };
 
