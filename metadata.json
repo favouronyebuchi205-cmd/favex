@@ -1,0 +1,8 @@
+{
+  "name": "Fav AI Chatbot",
+  "description": "A responsive and futuristic AI chatbot application featuring a sleek UI, login/signup forms, and powered by the Gemini language model for intelligent, streaming conversations.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}

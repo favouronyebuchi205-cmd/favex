@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FAV AI Chatbot</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;700&family=Roboto:wght@300;400;500&display=swap" rel="stylesheet">
+    <style>
+      :root {
+        --background-rgb: 248 249 250;
+        --foreground-rgb: 33 37 41;
+        --card-background-rgb: 255 255 255;
+        --primary-rgb: 0 123 255;
+        --border-color: #dee2e6;
+        --input-bg-rgb: 233 236 239;
+      }
+      .dark {
+        --background-rgb: 18 18 18;
+        --foreground-rgb: 224 224 224;
+        --card-background-rgb: 30 30 30;
+        --primary-rgb: 50 150 255;
+        --border-color: #495057;
+        --input-bg-rgb: 43 48 53;
+      }
+      
+      body {
+        font-family: 'Roboto', sans-serif;
+        background-color: rgb(var(--background-rgb));
+        color: rgb(var(--foreground-rgb));
+      }
+      .font-orbitron {
+        font-family: 'Orbitron', sans-serif;
+      }
+
+      /* Animations */
+      @keyframes message-in {
+        from {
+          opacity: 0;
+          transform: translateY(10px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+      .animate-message-in {
+        animation: message-in 0.3s ease-out forwards;
+      }
+
+      @keyframes modal-fade-in {
+        from {
+          opacity: 0;
+          transform: scale(0.95);
+        }
+        to {
+          opacity: 1;
+          transform: scale(1);
+        }
+      }
+      .animate-modal-in {
+        animation: modal-fade-in 0.2s ease-out forwards;
+      }
+    </style>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+    }
+  </script>
+  <script type="importmap">
+{
+  "imports": {
+    "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/",
+    "react/": "https://aistudiocdn.com/react@^19.2.0/",
+    "react": "https://aistudiocdn.com/react@^19.2.0",
+    "@google/genai": "https://aistudiocdn.com/@google/genai@^1.22.0"
+  }
+}
+</script>
+</head>
+  <body class="transition-colors duration-300">
+    <div id="root"></div>
+    <script type="module" src="/index.tsx"></script>
+  </body>
+</html>
